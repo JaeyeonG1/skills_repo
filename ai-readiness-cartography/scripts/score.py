@@ -49,6 +49,10 @@ RE_DEPS_HEADING = re.compile(r"^#+\s.*(depend|cross[- ]module|imports?|see also|
 RE_PURPOSE_HEADING = re.compile(r"^#+\s.*(purpose|owns?|configures?|overview)", re.IGNORECASE | re.MULTILINE)
 RE_PATTERN_HEADING = re.compile(r"^#+\s.*(pattern|how to|common change|workflow|recipe)", re.IGNORECASE | re.MULTILINE)
 RE_MERMAID = re.compile(r"```mermaid", re.IGNORECASE)
+RE_GRADLE_INCLUDE = re.compile(
+    r'^\s*include\s*\(?\s*["\']:?([A-Za-z0-9_:\-\.]+)["\']\s*\)?',
+    re.MULTILINE,
+)
 
 
 # ----------------------------------------------------------------------------
@@ -109,36 +113,75 @@ def walk_files(root: Path) -> list[Path]:
     return out
 
 
-def find_core_modules(repo: Path) -> list[Module]:
-    """Top-level + apps/* + packages/* + services/* code-bearing dirs."""
-    candidates: list[Path] = []
+def parse_gradle_modules(repo: Path) -> list[str]:
+    """Parse `include(':a:b:c')` from settings.gradle(.kts).
+    Returns list of disk-relative paths (e.g. 'libraries/bluetooth').
+    Empty list if no gradle settings file present.
+    """
+    candidates = [repo / "settings.gradle.kts", repo / "settings.gradle"]
+    settings = next((p for p in candidates if p.exists()), None)
+    if settings is None:
+        return []
+    text = read_text(settings)
+    paths: list[str] = []
+    for m in RE_GRADLE_INCLUDE.finditer(text):
+        gradle_path = m.group(1)
+        disk_path = gradle_path.replace(":", "/")
+        paths.append(disk_path)
+    return paths
 
-    # top-level dirs
+
+def _gradle_candidates(repo: Path, gradle_paths: list[str]) -> list[Path]:
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for gp in gradle_paths:
+        d = repo / gp
+        if d in seen or not d.is_dir():
+            continue
+        seen.add(d)
+        out.append(d)
+    return out
+
+
+def _legacy_candidates(repo: Path) -> list[Path]:
+    out: list[Path] = []
     for d in sorted(repo.iterdir()):
-        if not d.is_dir():
+        if not d.is_dir() or d.name in IGNORE_DIRS or d.name.startswith("."):
             continue
-        if d.name in IGNORE_DIRS or d.name.startswith("."):
-            continue
-        candidates.append(d)
-
-    # monorepo level
+        out.append(d)
     for parent_name in ("apps", "packages", "services"):
         parent = repo / parent_name
         if parent.exists() and parent.is_dir():
-            # remove the parent from candidates if there
-            candidates = [c for c in candidates if c != parent]
+            out = [c for c in out if c != parent]
             for d in sorted(parent.iterdir()):
                 if d.is_dir() and d.name not in IGNORE_DIRS:
-                    candidates.append(d)
+                    out.append(d)
+    return out
+
+
+def _count_code_files(d: Path) -> int:
+    n = 0
+    for r, dirs, files in os.walk(d):
+        dirs[:] = [x for x in dirs if x not in IGNORE_DIRS and not x.startswith(".")]
+        for f in files:
+            if Path(f).suffix in CODE_EXTS:
+                n += 1
+    return n
+
+
+def find_core_modules(repo: Path) -> list[Module]:
+    """Gradle multi-project → use settings.gradle modules.
+    Otherwise → top-level + apps/packages/services children (legacy behavior).
+    """
+    gradle_paths = parse_gradle_modules(repo)
+    if gradle_paths:
+        candidates = _gradle_candidates(repo, gradle_paths)
+    else:
+        candidates = _legacy_candidates(repo)
 
     modules: list[Module] = []
     for d in candidates:
-        code_count = 0
-        for r, dirs, files in os.walk(d):
-            dirs[:] = [x for x in dirs if x not in IGNORE_DIRS and not x.startswith(".")]
-            for f in files:
-                if Path(f).suffix in CODE_EXTS:
-                    code_count += 1
+        code_count = _count_code_files(d)
         if code_count == 0:
             continue
         ctx_file, ctx_kind = pick_context_file(d)
@@ -150,6 +193,7 @@ def find_core_modules(repo: Path) -> list[Module]:
             context_file=ctx_file,
             context_kind=ctx_kind,
         ))
+    modules.sort(key=lambda m: m.rel)
     return modules
 
 
@@ -828,6 +872,7 @@ def build_report(repo: Path) -> Report:
             "modules_total": len(modules),
             "context_files_total": len(context_files),
             "large_files_300plus": len(large_files),
+            "gradle_mode": bool(parse_gradle_modules(repo)),
         },
         total=total,
         grade=grade,
